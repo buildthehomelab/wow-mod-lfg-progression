@@ -13,13 +13,15 @@ With the module:
 
 - **Dungeons from an era you haven't reached are locked.** The Burning Crusade dungeons open at
   progression 8 (the Dark Portal), Wrath of the Lich King dungeons at 13 (Northrend). In the
-  Specific Dungeons list they show the lock icon, with the "requires expansion" reason.
+  Specific Dungeons list they show the lock icon, with "You have not completed the required
+  quest" as the reason (individual progression is kept as quests).
 - **Their random entries disappear.** Random Burning Crusade and Random Wrath of the Lich King
   (and their heroics) aren't offered until you reach that era, so the finder recommends the best
   random of your own era, Random Classic Dungeon at 60.
-- **Random Classic stays available while you're held in vanilla**, even at the level where the
-  client would normally move you to the TBC random. Which dungeons it can pick still depends on
-  each dungeon's own level range.
+- **Random Classic stays available while you're held in vanilla.** Stock data ends it at level
+  58, where the Dungeon Finder normally moves you on to the TBC random. At 60 it picks from the
+  classic dungeons whose own level range still covers you, such as Lower Blackrock Spire, Dire Maul
+  and Blackrock Depths' Upper City.
 - **Groups are checked per player.** A group can only queue for a dungeon every real player in it
   has unlocked.
 - **Bots are never locked**, so a playerbot can't keep a group out of a dungeon its real players
@@ -84,12 +86,13 @@ mod-lfg-progression: enabled, TBC dungeons at progression 8, WotLK at 13, limit 
 ## How it works
 
 - `GlobalScript::OnInitializeLockedDungeons` locks every LFG dungeon whose expansion is past the
-  player's era with `LFG_LOCKSTATUS_INSUFFICIENT_EXPANSION`. The core uses that lock map both for
-  what the client shows and for which dungeons a queue may pick, so a locked dungeon can never be
-  matched.
+  player's era with `LFG_LOCKSTATUS_QUEST_NOT_COMPLETED`, and lifts the level lock on Random
+  Classic Dungeon for vanilla-era players. The core uses that lock map both for what the client
+  shows and for which dungeons a queue may pick, so a locked dungeon can never be matched.
 - `ServerScript::CanPacketSend` rewrites `SMSG_LFG_PLAYER_INFO`, the packet that lists the random
-  dungeons the client offers, without the randoms of locked expansions. The client picks its
-  recommended random from that list.
+  dungeons the client offers, without the randoms of locked expansions, and with Random Classic
+  added back when nothing else is left. The client picks its recommended random from that list.
+  A random still needs to be unlocked in the lock map, or the client hides it.
 
 ## License
 
