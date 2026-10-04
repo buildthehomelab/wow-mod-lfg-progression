@@ -7,9 +7,9 @@
  * recommends the TBC random because it fits the level best. Joining one teleports the group
  * straight into an Outland instance, past individual progression's Dark Portal check.
  *
- * Here a dungeon from an expansion the player hasn't reached is locked like a missing expansion,
- * and its random entry is taken out of the random list, so the finder recommends the best random
- * of the player's own era. Individual progression keeps the era as rewarded quests 66000 + state:
+ * Here a dungeon from an expansion the player hasn't reached is locked, and its random entry is
+ * taken out of the random list. Random Classic Dungeon, which stock data ends at level 58, stays
+ * available while the player is held in the vanilla era, so the finder recommends it at 60. Individual progression keeps the era as rewarded quests 66000 + state:
  * The Burning Crusade opens at state 8 and Wrath of the Lich King at state 13, and nothing opens
  * past IndividualProgression.ProgressionLimit.
  *
@@ -241,9 +241,9 @@ namespace
                 hasRegularRandom = true;
         }
 
-        // Random Classic Dungeon stops at the level where the core hands the player over to the
+        // Random Classic Dungeon ends at level 58, where the core hands the player over to the
         // TBC random. A player held in the vanilla era gets it back, so the finder still has a
-        // random to recommend. Its dungeons keep their own level checks.
+        // random to recommend. OnInitializeLockedDungeons lifts its level lock to match.
         bool addClassic = false;
         if (!hasRegularRandom && allowed == EXPANSION_CLASSIC)
         {
@@ -306,12 +306,25 @@ public:
 
     void OnInitializeLockedDungeons(Player* player, uint8& /*level*/, uint32& lockData, lfg::LFGDungeonData const* dungeon) override
     {
-        // A dungeon the core already locks keeps the core's reason.
-        if (lockData || !dungeon)
+        if (!dungeon)
             return;
 
-        if (dungeon->expansion > AllowedExpansion(player))
-            lockData = lfg::LFG_LOCKSTATUS_INSUFFICIENT_EXPANSION;
+        uint8 allowed = AllowedExpansion(player);
+
+        // Random Classic Dungeon ends at level 58, where the core moves players on to the TBC
+        // random. A player held in the vanilla era keeps it; its dungeons keep their own level
+        // checks. FilterPlayerInfo puts it back in the random list.
+        if (allowed == EXPANSION_CLASSIC && dungeon->id == RANDOM_CLASSIC_DUNGEON && lockData == lfg::LFG_LOCKSTATUS_TOO_HIGH_LEVEL)
+        {
+            lockData = 0;
+            return;
+        }
+
+        // A dungeon the core already locks keeps the core's reason. The era lock reads "You have
+        // not completed the required quest": individual progression is kept as quests, and the
+        // expansion reason told players they don't own The Burning Crusade.
+        if (!lockData && dungeon->expansion > allowed)
+            lockData = lfg::LFG_LOCKSTATUS_QUEST_NOT_COMPLETED;
     }
 };
 
