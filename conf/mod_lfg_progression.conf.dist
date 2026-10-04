@@ -1,0 +1,38 @@
+[worldserver]
+
+########################################
+# mod-lfg-progression
+#
+# The Dungeon Finder follows mod-individual-progression: dungeons of an expansion the player
+# hasn't reached are locked, and their random entries leave the random list, so the finder
+# recommends a random from the player's own era.
+#
+# Who is gated, and the highest state anyone can reach, come from individual progression's
+# own config (IndividualProgression.Enable, .ProgressionLimit, .ExcludedAccountsRegex).
+########################################
+
+#
+#    LfgProgression.Enable
+#        Description: Master switch.
+#        Default:     1
+#
+
+LfgProgression.Enable = 1
+
+#
+#    LfgProgression.TbcState
+#        Description: Individual progression state that opens The Burning Crusade dungeons.
+#                     8 is the state that opens the Dark Portal.
+#        Default:     8
+#
+
+LfgProgression.TbcState = 8
+
+#
+#    LfgProgression.WotlkState
+#        Description: Individual progression state that opens the Wrath of the Lich King dungeons.
+#                     13 is the state that opens Northrend.
+#        Default:     13
+#
+
+LfgProgression.WotlkState = 13
