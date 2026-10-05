@@ -1,370 +1,439 @@
 /*
  * mod-lfg-progression
  *
- * Makes the Dungeon Finder follow mod-individual-progression. The core only locks LFG dungeons by
- * the account's expansion and the player's level, so a level 60 still in the vanilla era is
- * offered Random Burning Crusade, the TBC heroics and Hellfire Ramparts, and the client
- * recommends the TBC random because it fits the level best. Joining one teleports the group
- * straight into an Outland instance, past individual progression's Dark Portal check.
+ * Based on MekBits/mod-lfg-expansion (https://github.com/MekBits/mod-lfg-expansion),
+ * GNU Affero General Public License v3.0.
  *
- * Here a dungeon from an expansion the player hasn't reached is locked, and its random entry is
- * taken out of the random list. Random Classic Dungeon, which stock data ends at level 58, stays
- * available while the player is held in the vanilla era, so the finder recommends it at 60. Individual progression keeps the era as rewarded quests 66000 + state:
- * The Burning Crusade opens at state 8 and Wrath of the Lich King at state 13, and nothing opens
- * past IndividualProgression.ProgressionLimit.
+ * The Dungeon Finder stays inside the expansion a character has reached, in
+ * both directions:
  *
- * Bots, game masters and IndividualProgression.ExcludedAccountsRegex accounts are never locked,
- * the same accounts individual progression leaves alone, so a bot can't keep a group out of a
- * dungeon the real players have unlocked.
+ *   players      never get a dungeon from an expansion they have not reached
+ *   random bots  follow the real players' expansion: at most 60 with a
+ *                vanilla player, at most 70 with a TBC player (mod-playerbots)
  *
- * Released under the MIT License.
+ * PLAYERS. Random Classic stops at 58 and Random Burning Crusade starts at 59
+ * in LFGDungeons.dbc, so a level 59-60 is only offered TBC. For a vanilla
+ * character under mod-individual-progression that is worse than wrong: IP
+ * turns it away at the entrance of every Outland instance.
+ *
+ * The levels can NOT be fixed in data alone: the client's LFDFrame.lua only
+ * shows a random dungeon if the player's level is inside the CLIENT's DBC
+ * range (isRandomDungeonDisplayable). So the random id is swapped on queue in
+ * OnPlayerQueueRandomDungeon, the same trick as mod-rdf-expansion -- only per
+ * group instead of globally. The player picks "Random Burning Crusade", queues
+ * for Random Classic, and the queue status shows Random Classic afterwards
+ * (JoinLfg stores the swapped id with SetSelectedDungeons).
+ *
+ * The player lock is the core's own. LFGMgr::InitializeLockedDungeons works
+ * out every player's locked dungeons on login and on every level change and
+ * calls OnInitializeLockedDungeons for each dungeon; GetCompatibleDungeons()
+ * removes the locked ones on join, also after a random dungeon is expanded.
+ *
+ * RANDOM BOTS. mod-playerbots lets random bots queue for exactly the dungeons
+ * a real player is queued for (RandomPlayerbotMgr::CheckLfgQueue), and picks
+ * them by level alone. A level 55 dungeon takes bots up to 65.
+ *
+ * Which bot has to fit whom is only known when the queue builds a proposal,
+ * so the rule sits there: LFGQueue::CheckCompatibility asks GlobalScript's
+ * CanCreateLfgProposal right before the proposal is created, and a no skips
+ * the combination. That call runs in a map updater thread while maps update,
+ * so it touches no Player: every queue entry's expansion and bot level are
+ * stored on join, which runs in the world thread while no map updates --
+ * players because CMSG_LFG_JOIN is PROCESS_THREADUNSAFE, bots because
+ * PlayerbotHolder::HandleBotPackets is called from WorldScript::OnUpdate and
+ * from the master's SessionScript::OnSessionUpdate under ProcessUnsafe.
+ *
+ * mod-individual-progression and mod-playerbots are optional. With IP, a
+ * character's expansion is its IP tier; without it, its level. Without
+ * playerbots there are no random bots, and the bot rule is not built.
  */
 
+#include <algorithm>
+#include <map>
+#include <mutex>
+#include <set>
+#include <vector>
+
 #include "Config.h"
-#include "AccountMgr.h"
+#include "Group.h"
 #include "LFG.h"
 #include "LFGMgr.h"
 #include "Log.h"
-#include "ObjectMgr.h"
 #include "Player.h"
-#include "QuestDef.h"
 #include "ScriptMgr.h"
-#include "WorldPacket.h"
 #include "WorldSession.h"
 
-#include <mutex>
-#include <regex>
-#include <string>
-#include <type_traits>
-#include <unordered_map>
-#include <utility>
-#include <vector>
+#if __has_include("IndividualProgression.h")
+#include "IndividualProgression.h"
+#define LFGP_WITH_INDIVIDUAL_PROGRESSION 1
+#endif
+
+#if __has_include("PlayerbotAIConfig.h")
+#include "PlayerbotAIConfig.h"
+#define LFGP_WITH_PLAYERBOTS 1
+#endif
+
+#include "lfg_progression_rules.h"
 
 namespace
 {
-    constexpr uint32 PROGRESSION_QUEST_BASE = 66000;   // individual progression: state N = quest 66000 + N rewarded
-    constexpr uint8 PROGRESSION_MAX = 18;
-    constexpr uint8 NO_LIMIT = 0xFF;
-    constexpr uint32 RANDOM_CLASSIC_DUNGEON = 258;     // LFGDungeons.dbc
+    LfgProgression::Settings g_settings;
 
-    struct Config
+    // Playerbots' own definition of a random bot: the account is in
+    // randomBotAccounts. That list is filled once at startup, so it is safe
+    // to read from the map threads, where a bot's own level-up happens.
+    // RandomPlayerbotMgr::IsRandomBot() is not -- it looks in currentBots,
+    // which the world thread changes all the time.
+    bool IsRandomBot([[maybe_unused]] Player* player)
     {
-        bool enabled = true;
-        bool individualProgression = false;
-        uint8 tbcState = 8;
-        uint8 wotlkState = 13;
-        uint8 progressionLimit = 0;
-        std::string excludedAccounts;
-    };
-
-    Config config;
-
-    std::mutex excludedMutex;
-    std::unordered_map<uint32, bool> excludedCache;
-
-    // Bots are sessions without a socket. AzerothCore marks them with WorldSession::IsHeadless();
-    // older playerbots core forks have WorldSession::IsBot() instead, and older stock cores have
-    // neither. Looking for both at compile time lets the module build on all of them.
-    template <typename Session, typename = void>
-    struct HasIsHeadless : std::false_type { };
-
-    template <typename Session>
-    struct HasIsHeadless<Session, std::void_t<decltype(std::declval<Session&>().IsHeadless())>> : std::true_type { };
-
-    template <typename Session, typename = void>
-    struct HasIsBot : std::false_type { };
-
-    template <typename Session>
-    struct HasIsBot<Session, std::void_t<decltype(std::declval<Session&>().IsBot())>> : std::true_type { };
-
-    template <typename Session>
-    bool IsBotSession(Session* session)
-    {
-        if constexpr (HasIsHeadless<Session>::value)
-            return session->IsHeadless();
-        else if constexpr (HasIsBot<Session>::value)
-            return session->IsBot();
-        else
-            return false;
-    }
-
-    bool IsExcludedAccount(uint32 accountId)
-    {
-        if (config.excludedAccounts.empty())
-            return false;
-
-        std::lock_guard<std::mutex> lock(excludedMutex);
-        auto itr = excludedCache.find(accountId);
-        if (itr != excludedCache.end())
-            return itr->second;
-
-        // AccountMgr::GetName asks the database, so each account is looked up once.
-        std::string name;
-        bool excluded = false;
-        if (AccountMgr::GetName(accountId, name))
-        {
-            try
-            {
-                excluded = std::regex_match(name, std::regex(config.excludedAccounts));
-            }
-            catch (std::regex_error const&)
-            {
-                excluded = false;
-            }
-        }
-
-        excludedCache[accountId] = excluded;
-        return excluded;
-    }
-
-    uint8 ProgressionState(Player* player)
-    {
-        uint8 state = 0;
-        for (uint8 i = 1; i <= PROGRESSION_MAX; ++i)
-            if (player->GetQuestStatus(PROGRESSION_QUEST_BASE + i) == QUEST_STATUS_REWARDED)
-                state = i;
-        return state;
-    }
-
-    // Mirrors IndividualProgression::hasPassedProgression: a state past the limit never counts.
-    bool HasReached(uint8 playerState, uint8 required)
-    {
-        if (config.progressionLimit && required > config.progressionLimit)
-            return false;
-        return playerState >= required;
-    }
-
-    // The newest expansion whose dungeons this player may queue for, or NO_LIMIT when the player
-    // isn't gated at all.
-    uint8 AllowedExpansion(Player* player)
-    {
-        if (!config.enabled || !config.individualProgression || !player)
-            return NO_LIMIT;
-
+#ifdef LFGP_WITH_PLAYERBOTS
         WorldSession* session = player->GetSession();
-        if (!session || IsBotSession(session) || player->IsGameMaster() || IsExcludedAccount(session->GetAccountId()))
-            return NO_LIMIT;
-
-        uint8 state = ProgressionState(player);
-        if (HasReached(state, config.wotlkState))
-            return EXPANSION_WRATH_OF_THE_LICH_KING;
-        if (HasReached(state, config.tbcState))
-            return EXPANSION_THE_BURNING_CRUSADE;
-        return EXPANSION_CLASSIC;
+        return session && session->IsHeadless() && sPlayerbotAIConfig.IsInRandomAccountList(session->GetAccountId());
+#else
+        return false;
+#endif
     }
 
-    // One random dungeon entry of SMSG_LFG_PLAYER_INFO, written the way
-    // WorldSession::HandleLfgPlayerLockInfoRequestOpcode writes it.
-    void AppendRandomDungeon(WorldPacket& data, Player* player, uint32 entry)
+    // mod-individual-progression's expansion for the character, or -1 if IP
+    // does not control the account. isNormalAccount() looks the account name
+    // up in the database and builds a regex per call, so it is only called
+    // when the level alone does not decide (see PlayerExpansion).
+    int IpTier([[maybe_unused]] Player* player)
     {
-        uint8 level = player->GetLevel();
-        data << uint32(entry);
+#ifdef LFGP_WITH_INDIVIDUAL_PROGRESSION
+        if (!sIndividualProgression->enabled || !sIndividualProgression->isNormalAccount(player))
+            return -1;
+        if (sIndividualProgression->hasPassedProgression(player, PROGRESSION_TBC_TIER_5))
+            return LfgProgression::EXPANSION_WOTLK;
+        if (sIndividualProgression->hasPassedProgression(player, PROGRESSION_PRE_TBC))
+            return LfgProgression::EXPANSION_TBC;
+        return LfgProgression::EXPANSION_CLASSIC;
+#else
+        return -1;
+#endif
+    }
 
-        Quest const* quest = nullptr;
-        bool done = false;
-        if (lfg::LfgReward const* reward = sLFGMgr->GetRandomDungeonReward(entry, level))
+    uint8 PlayerExpansion(Player* player, uint8 level)
+    {
+        // Already in the highest expansion by level: IP can only lift.
+        if (LfgProgression::ExpansionForLevel(g_settings, level) == LfgProgression::EXPANSION_WOTLK)
+            return LfgProgression::EXPANSION_WOTLK;
+        return LfgProgression::PlayerExpansion(g_settings, level, IpTier(player));
+    }
+
+    // InitializeLockedDungeons() calls the lock hook once per dungeon with the
+    // same player, and IpTier() costs two synchronous auth database lookups
+    // and two regexes per call. So the expansion is worked out once per pass
+    // and forgotten in OnAfterInitializeLockedDungeons -- the IP tier can
+    // change without the level changing. thread_local, because the locks are
+    // worked out both in the world thread (login) and in the map threads
+    // (level change).
+    struct LockPass
+    {
+        ObjectGuid guid;
+        uint8 level = 0;
+        uint8 expansion = 0;
+    };
+    thread_local LockPass t_lockPass;
+
+    uint8 PlayerExpansionForLockPass(Player* player, uint8 level)
+    {
+        if (t_lockPass.guid != player->GetGUID() || t_lockPass.level != level)
+            t_lockPass = { player->GetGUID(), level, PlayerExpansion(player, level) };
+        return t_lockPass.expansion;
+    }
+
+#ifdef LFGP_WITH_PLAYERBOTS
+    // Queue entries by LFG's queue guid (the group's, otherwise the player's).
+    // Written in the world thread on join and on level change in the map
+    // threads, read by the LFG queue in a map updater thread.
+    std::mutex g_queueMutex;
+    std::map<ObjectGuid, LfgProgression::QueueEntry> g_queueEntries;
+
+    // Only called from JoinLfg in the world thread while no map updates, so
+    // every member of the group may be read, also those on other maps.
+    LfgProgression::QueueEntry QueueEntryFor(Player* leader, std::set<uint32> const& dungeons)
+    {
+        LfgProgression::QueueEntry entry;
+
+        entry.seasonal = !dungeons.empty() && std::all_of(dungeons.begin(), dungeons.end(), [](uint32 id)
         {
-            quest = sObjectMgr->GetQuestTemplate(reward->firstQuest);
-            if (quest)
+            lfg::LFGDungeonData const* dungeon = sLFGMgr->GetLFGDungeon(id);
+            return dungeon && dungeon->seasonal;
+        });
+
+        auto add = [&entry](Player* member)
+        {
+            uint8 const level = member->GetLevel();
+            if (IsRandomBot(member))
             {
-                done = !player->CanRewardQuest(quest, false);
-                if (done)
-                    quest = sObjectMgr->GetQuestTemplate(reward->otherQuest);
+                entry.highestBotLevel = std::max(entry.highestBotLevel, level);
+                return;
             }
-        }
+            uint8 const expansion = PlayerExpansion(member, level);
+            entry.hasPlayers = true;
+            entry.lowestTier = std::min(entry.lowestTier, expansion);
+            entry.highestTier = std::max(entry.highestTier, expansion);
+        };
 
-        if (!quest)
+        if (Group* group = leader->GetGroup())
         {
-            data << uint8(0) << uint32(0) << uint32(0) << uint32(0) << uint32(0) << uint8(0);
+            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+                if (Player* member = ref->GetSource())
+                    add(member);
+        }
+        else
+            add(leader);
+
+        return entry;
+    }
+
+    bool BotRuleActive()
+    {
+        return g_settings.enabled && g_settings.botLock;
+    }
+#endif
+}
+
+class LfgProgressionWorld : public WorldScript
+{
+public:
+    LfgProgressionWorld() : WorldScript("LfgProgressionWorld") { }
+
+    // Read here and not in the hooks: GetOption() logs "Missing property" on
+    // every call when a key is missing, and the lock hook runs ~300 times per
+    // character per level change.
+    void OnAfterConfigLoad(bool /*reload*/) override
+    {
+        g_settings.enabled         = sConfigMgr->GetOption<bool>("LfgProgression.Enable", true);
+        g_settings.classicMaxLevel = uint8(sConfigMgr->GetOption<uint32>("LfgProgression.ClassicMaxLevel", 60));
+        g_settings.tbcMaxLevel     = uint8(sConfigMgr->GetOption<uint32>("LfgProgression.TbcMaxLevel", 70));
+
+#ifdef LFGP_WITH_INDIVIDUAL_PROGRESSION
+        char const* const ip = "found";
+#else
+        char const* const ip = "not found";
+#endif
+
+#ifdef LFGP_WITH_PLAYERBOTS
+        g_settings.botLock = sConfigMgr->GetOption<bool>("LfgProgression.BotLock", true);
+
+        uint32 const botTier = sConfigMgr->GetOption<uint32>("LfgProgression.BotTier", LfgProgression::BOT_TIER_LOWEST);
+        if (botTier > LfgProgression::BOT_TIER_HIGHEST)
+            LOG_ERROR("module", "LfgProgression.BotTier = {} is invalid (0 or 1); using 0", botTier);
+        g_settings.botTier = botTier == LfgProgression::BOT_TIER_HIGHEST ? LfgProgression::BOT_TIER_HIGHEST : LfgProgression::BOT_TIER_LOWEST;
+
+        char const* const bots = !g_settings.botLock ? "found, random bots not held"
+            : g_settings.botTier == LfgProgression::BOT_TIER_HIGHEST ? "found, random bots follow the highest player expansion"
+            : "found, random bots follow the lowest player expansion";
+#else
+        char const* const bots = "not found";
+#endif
+
+        LOG_INFO("module", "LfgProgression: {} (vanilla up to level {}, TBC up to {}; individual progression {}, playerbots {})",
+                 g_settings.enabled ? "enabled" : "disabled",
+                 g_settings.classicMaxLevel, g_settings.tbcMaxLevel, ip, bots);
+    }
+};
+
+class LfgProgressionGlobal : public GlobalScript
+{
+public:
+    LfgProgressionGlobal() : GlobalScript("LfgProgressionGlobal", {
+        GLOBALHOOK_ON_INITIALIZE_LOCKED_DUNGEONS,
+        GLOBALHOOK_ON_AFTER_INITIALIZE_LOCKED_DUNGEONS,
+#ifdef LFGP_WITH_PLAYERBOTS
+        GLOBALHOOK_CAN_CREATE_LFG_PROPOSAL,
+#endif
+    }) { }
+
+    void OnInitializeLockedDungeons(Player* player, uint8& level, uint32& lockData, lfg::LFGDungeonData const* dungeon) override
+    {
+        // A dungeon the core already locked keeps its own reason.
+        if (lockData || !dungeon || !player || !g_settings.enabled)
             return;
-        }
 
-        uint8 levelForXP = level;
-        sScriptMgr->OnPlayerBeforeGetLevelForXPGain(player, levelForXP);
+        // Random bots have no expansion of their own; they are held in the
+        // queue instead (see CanCreateLfgProposal).
+        if (IsRandomBot(player))
+            return;
 
-        data << uint8(done);
-        data << uint32(quest->GetRewOrReqMoney(level));
-        data << uint32(levelForXP < player->GetUInt32Value(PLAYER_FIELD_MAX_LEVEL) ? quest->XPValue(levelForXP) : 0);
-        data << uint32(0);
-        data << uint32(0);
-        data << uint8(quest->GetRewItemsCount());
-        for (uint8 i = 0; i < QUEST_REWARDS_COUNT; ++i)
-        {
-            if (uint32 itemId = quest->RewardItemId[i])
-            {
-                ItemTemplate const* item = sObjectMgr->GetItemTemplate(itemId);
-                data << uint32(itemId);
-                data << uint32(item ? item->DisplayInfoID : 0);
-                data << uint32(quest->RewardItemIdCount[i]);
-            }
-        }
+        // Cheapest check first: only a dungeon from a later expansion than the
+        // level's can be locked, and only then is IP looked up.
+        bool const isRandomEntry = dungeon->type == lfg::LFG_TYPE_RANDOM;
+        if (isRandomEntry || dungeon->expansion <= LfgProgression::ExpansionForLevel(g_settings, level))
+            return;
+
+        // "You have not completed the required quest", not the expansion reason: the client
+        // reads LFG_LOCKSTATUS_INSUFFICIENT_EXPANSION as "you don't own The Burning Crusade",
+        // which is wrong on a realm where everyone has the expansion and the era is earned.
+        if (LfgProgression::IsPlayerLocked(g_settings, PlayerExpansionForLockPass(player, level), dungeon->expansion, isRandomEntry))
+            lockData = lfg::LFG_LOCKSTATUS_QUEST_NOT_COMPLETED;
     }
 
-    // Rebuilds SMSG_LFG_PLAYER_INFO without the random dungeons of a locked expansion. Returns
-    // false when the packet needs no change.
-    bool FilterPlayerInfo(WorldPacket const& original, Player* player, uint8 allowed, WorldPacket& filtered)
+    void OnAfterInitializeLockedDungeons(Player* /*player*/) override
     {
-        WorldPacket in(original);
-        in.rpos(0);
+        t_lockPass = {};
+    }
 
-        struct RandomEntry { uint32 entry; size_t start; size_t end; };
-        std::vector<RandomEntry> randoms;
+#ifdef LFGP_WITH_PLAYERBOTS
+    // LFGQueue::CheckCompatibility, right before a full proposal is created. A
+    // no skips the combination; the bot stays in the queue for another group.
+    // Runs in a map updater thread: only the stored queue entries are read.
+    bool CanCreateLfgProposal(lfg::Lfg5Guids const& guids) override
+    {
+        if (!BotRuleActive())
+            return true;
 
-        uint8 count = in.read<uint8>();
-        for (uint8 i = 0; i < count; ++i)
+        std::vector<LfgProgression::QueueEntry> entries;
+        entries.reserve(guids.guids.size());
         {
-            RandomEntry random;
-            random.start = in.rpos();
-            random.entry = in.read<uint32>();
-            in.read_skip<uint8>();                          // done
-            in.read_skip<uint32>();                         // money
-            in.read_skip<uint32>();                         // xp
-            in.read_skip<uint32>();
-            in.read_skip<uint32>();
-            uint8 items = in.read<uint8>();
-            in.read_skip(size_t(items) * 3 * sizeof(uint32));
-            random.end = in.rpos();
-            randoms.push_back(random);
-        }
-        size_t lockBlock = in.rpos();
-
-        std::vector<RandomEntry> kept;
-        bool hasRegularRandom = false;
-        for (RandomEntry const& random : randoms)
-        {
-            lfg::LFGDungeonData const* dungeon = sLFGMgr->GetLFGDungeon(random.entry & 0x00FFFFFF);
-            if (dungeon && dungeon->expansion > allowed)
-                continue;
-
-            kept.push_back(random);
-            if (dungeon && !dungeon->seasonal)
-                hasRegularRandom = true;
+            std::lock_guard<std::mutex> lock(g_queueMutex);
+            for (ObjectGuid const& guid : guids.guids)
+            {
+                if (guid.IsEmpty())
+                    continue;
+                auto it = g_queueEntries.find(guid);
+                if (it != g_queueEntries.end())
+                    entries.push_back(it->second);
+            }
         }
 
-        // Random Classic Dungeon ends at level 58, where the core hands the player over to the
-        // TBC random. A player held in the vanilla era gets it back, so the finder still has a
-        // random to recommend. OnInitializeLockedDungeons lifts its level lock to match.
-        bool addClassic = false;
-        if (!hasRegularRandom && allowed == EXPANSION_CLASSIC)
+        if (LfgProgression::IsProposalAllowed(g_settings, entries))
+            return true;
+
+        LOG_DEBUG("module", "LfgProgression: proposal {} rejected, a random bot is above the players' expansion", guids.toString());
+        return false;
+    }
+#endif
+};
+
+class LfgProgressionPlayer : public PlayerScript
+{
+public:
+    LfgProgressionPlayer() : PlayerScript("LfgProgressionPlayer", {
+        PLAYERHOOK_ON_QUEUE_RANDOM_DUNGEON,
+#ifdef LFGP_WITH_PLAYERBOTS
+        PLAYERHOOK_CAN_JOIN_LFG,
+        PLAYERHOOK_ON_LEVEL_CHANGED,
+        PLAYERHOOK_ON_LOGOUT,
+#endif
+    }) { }
+
+    // Called in LFGMgr::JoinLfg with the player who queues -- the group
+    // leader, if there is a group -- before the random id is expanded into
+    // dungeons.
+    void OnPlayerQueueRandomDungeon(Player* player, uint32& rDungeonId) override
+    {
+        if (!player || !g_settings.enabled)
+            return;
+
+        // Random bots queue by level and are held in the queue
+        // (CanCreateLfgProposal).
+        if (IsRandomBot(player))
+            return;
+
+        uint8 groupExpansion = PlayerExpansion(player, player->GetLevel());
+        if (Group* group = player->GetGroup())
         {
-            lfg::LFGDungeonData const* classic = sLFGMgr->GetLFGDungeon(RANDOM_CLASSIC_DUNGEON);
-            addClassic = classic && player->GetLevel() >= classic->minlevel;
+            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+            {
+                Player* member = ref->GetSource();
+                if (!member || member == player || IsRandomBot(member))
+                    continue;
+                groupExpansion = LfgProgression::GroupExpansion({ groupExpansion, PlayerExpansion(member, member->GetLevel()) });
+            }
         }
 
-        if (kept.size() == randoms.size() && !addClassic)
-            return false;
+        uint32 const swapped = LfgProgression::RandomFor(g_settings, rDungeonId, groupExpansion);
+        if (swapped == rDungeonId)
+            return;
 
-        filtered.Initialize(SMSG_LFG_PLAYER_INFO, original.size());
-        filtered << uint8(kept.size() + (addClassic ? 1 : 0));
-        if (addClassic)
-            AppendRandomDungeon(filtered, player, sLFGMgr->GetLFGDungeon(RANDOM_CLASSIC_DUNGEON)->Entry());
-        for (RandomEntry const& random : kept)
-            filtered.append(original.contents() + random.start, random.end - random.start);
-        if (original.size() > lockBlock)
-            filtered.append(original.contents() + lockBlock, original.size() - lockBlock);
+        LOG_INFO("module", "LfgProgression: {} (level {}) queues random {} -> {} (group expansion {})",
+                 player->GetName(), player->GetLevel(), rDungeonId, swapped, groupExpansion);
+        rDungeonId = swapped;
+    }
+
+#ifdef LFGP_WITH_PLAYERBOTS
+    // First in LFGMgr::JoinLfg, with the player who queues -- the group
+    // leader, if there is a group. Random bots come here too (they send
+    // CMSG_LFG_JOIN, which HandleBotPackets runs in the world thread).
+    bool OnPlayerCanJoinLfg(Player* player, uint8 /*roles*/, std::set<uint32>& dungeons, std::string const& /*comment*/) override
+    {
+        if (!player)
+            return true;
+
+        Group* group = player->GetGroup();
+        ObjectGuid const key = group ? group->GetGUID() : player->GetGUID();
+
+        // An entry from before BotLock was reloaded to 0 must not be read
+        // again if it is reloaded back to 1.
+        if (!BotRuleActive())
+        {
+            std::lock_guard<std::mutex> lock(g_queueMutex);
+            g_queueEntries.erase(key);
+            return true;
+        }
+
+        LfgProgression::QueueEntry const entry = QueueEntryFor(player, dungeons);
+
+        std::lock_guard<std::mutex> lock(g_queueMutex);
+        g_queueEntries[key] = entry;
         return true;
     }
 
-    thread_local bool resending = false;
-}
-
-class LfgProgressionWorldScript : public WorldScript
-{
-public:
-    LfgProgressionWorldScript() : WorldScript("LfgProgressionWorldScript", { WORLDHOOK_ON_AFTER_CONFIG_LOAD }) { }
-
-    void OnAfterConfigLoad(bool /*reload*/) override
+    // A random bot can be randomized while it is in the queue.
+    void OnPlayerLevelChanged(Player* player, uint8 /*oldLevel*/) override
     {
-        config.enabled = sConfigMgr->GetOption<bool>("LfgProgression.Enable", true);
-        config.tbcState = sConfigMgr->GetOption<uint8>("LfgProgression.TbcState", 8);
-        config.wotlkState = sConfigMgr->GetOption<uint8>("LfgProgression.WotlkState", 13);
-
-        // Individual progression's own settings, so both modules agree on who is gated.
-        config.individualProgression = sConfigMgr->GetOption<bool>("IndividualProgression.Enable", false, false);
-        config.progressionLimit = sConfigMgr->GetOption<uint8>("IndividualProgression.ProgressionLimit", 0, false);
-        config.excludedAccounts = sConfigMgr->GetOption<std::string>("IndividualProgression.ExcludedAccountsRegex", "", false);
-
-        {
-            std::lock_guard<std::mutex> lock(excludedMutex);
-            excludedCache.clear();
-        }
-
-        if (!config.enabled)
-            LOG_INFO("server.loading", "mod-lfg-progression: disabled");
-        else if (!config.individualProgression)
-            LOG_INFO("server.loading", "mod-lfg-progression: individual progression is off, the Dungeon Finder is not gated");
-        else
-            LOG_INFO("server.loading", "mod-lfg-progression: enabled, TBC dungeons at progression {}, WotLK at {}, limit {}",
-                uint32(config.tbcState), uint32(config.wotlkState), uint32(config.progressionLimit));
-    }
-};
-
-class LfgProgressionGlobalScript : public GlobalScript
-{
-public:
-    LfgProgressionGlobalScript() : GlobalScript("LfgProgressionGlobalScript", { GLOBALHOOK_ON_INITIALIZE_LOCKED_DUNGEONS }) { }
-
-    void OnInitializeLockedDungeons(Player* player, uint8& /*level*/, uint32& lockData, lfg::LFGDungeonData const* dungeon) override
-    {
-        if (!dungeon)
+        if (!player || !IsRandomBot(player))
             return;
 
-        uint8 allowed = AllowedExpansion(player);
+        Group* group = player->GetGroup();
+        ObjectGuid const key = group ? group->GetGUID() : player->GetGUID();
+        uint8 const level = player->GetLevel();
 
-        // Random Classic Dungeon ends at level 58, where the core moves players on to the TBC
-        // random. A player held in the vanilla era keeps it; its dungeons keep their own level
-        // checks. FilterPlayerInfo puts it back in the random list.
-        if (allowed == EXPANSION_CLASSIC && dungeon->id == RANDOM_CLASSIC_DUNGEON && lockData == lfg::LFG_LOCKSTATUS_TOO_HIGH_LEVEL)
-        {
-            lockData = 0;
+        std::lock_guard<std::mutex> lock(g_queueMutex);
+        auto it = g_queueEntries.find(key);
+        if (it == g_queueEntries.end())
             return;
-        }
-
-        // A dungeon the core already locks keeps the core's reason. The era lock reads "You have
-        // not completed the required quest": individual progression is kept as quests, and the
-        // expansion reason told players they don't own The Burning Crusade.
-        if (!lockData && dungeon->expansion > allowed)
-            lockData = lfg::LFG_LOCKSTATUS_QUEST_NOT_COMPLETED;
+        // Only the bot's own level is known here, not the rest of the group's.
+        it->second.highestBotLevel = group ? std::max(it->second.highestBotLevel, level) : level;
     }
+
+    void OnPlayerLogout(Player* player) override
+    {
+        if (!player)
+            return;
+        std::lock_guard<std::mutex> lock(g_queueMutex);
+        g_queueEntries.erase(player->GetGUID());
+    }
+#endif
 };
 
-class LfgProgressionServerScript : public ServerScript
+#ifdef LFGP_WITH_PLAYERBOTS
+class LfgProgressionGroup : public GroupScript
 {
 public:
-    LfgProgressionServerScript() : ServerScript("LfgProgressionServerScript", { SERVERHOOK_CAN_PACKET_SEND }) { }
+    LfgProgressionGroup() : GroupScript("LfgProgressionGroup", {
+        GROUPHOOK_ON_DISBAND
+    }) { }
 
-    bool CanPacketSend(WorldSession* session, WorldPacket const& packet) override
+    void OnDisband(Group* group) override
     {
-        if (resending || packet.GetOpcode() != SMSG_LFG_PLAYER_INFO || !session)
-            return true;
-
-        Player* player = session->GetPlayer();
-        uint8 allowed = AllowedExpansion(player);
-        if (!player || allowed == NO_LIMIT)
-            return true;
-
-        WorldPacket filtered;
-        try
-        {
-            if (!FilterPlayerInfo(packet, player, allowed, filtered))
-                return true;
-        }
-        catch (ByteBufferException const&)
-        {
-            LOG_ERROR("module", "mod-lfg-progression: could not read SMSG_LFG_PLAYER_INFO for {}, sent it unchanged", player->GetName());
-            return true;
-        }
-
-        resending = true;
-        session->SendPacket(&filtered);
-        resending = false;
-        return false;
+        if (!group)
+            return;
+        std::lock_guard<std::mutex> lock(g_queueMutex);
+        g_queueEntries.erase(group->GetGUID());
     }
 };
+#endif
 
 void AddLfgProgressionScripts()
 {
-    new LfgProgressionWorldScript();
-    new LfgProgressionGlobalScript();
-    new LfgProgressionServerScript();
+    new LfgProgressionWorld();
+    new LfgProgressionGlobal();
+    new LfgProgressionPlayer();
+#ifdef LFGP_WITH_PLAYERBOTS
+    new LfgProgressionGroup();
+#endif
 }

@@ -1,0 +1,19 @@
+name: core-build
+on:
+  push:
+    branches:
+      - 'master'
+      - 'main'
+  pull_request:
+    branches:
+      - 'master'
+      - 'main'
+  workflow_dispatch:
+
+jobs:
+  build:
+    uses: azerothcore/reusable-workflows/.github/workflows/core_build_modules.yml@main
+    with:
+      # The checkout folder, which AzerothCore turns into the loader name: the repo is
+      # wow-mod-lfg-progression, the module (and Addmod_lfg_progressionScripts) is not.
+      module_repo: mod-lfg-progression
