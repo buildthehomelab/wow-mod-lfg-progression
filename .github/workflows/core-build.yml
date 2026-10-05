@@ -14,4 +14,6 @@ jobs:
   build:
     uses: azerothcore/reusable-workflows/.github/workflows/core_build_modules.yml@main
     with:
-      module_repo: ${{ github.event.repository.name }}
+      # The checkout folder, which AzerothCore turns into the loader name: the repo is
+      # wow-mod-lfg-progression, the module (and Addmod_lfg_progressionScripts) is not.
+      module_repo: mod-lfg-progression
