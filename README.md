@@ -172,6 +172,14 @@ A module that is present in `modules/` but disabled in CMake still has its
 header found, and the build then fails at link time. Remove the directory
 instead.
 
+## Requirements
+
+- [AzerothCore](https://www.azerothcore.org/) wotlk (master) and a WoW 3.3.5a (12340) client.
+- Optional: [mod-individual-progression](https://github.com/ZhengPeiRu21/mod-individual-progression)
+  so a character's expansion is its progression tier. Without it the level decides.
+- Optional: [mod-playerbots](https://github.com/mod-playerbots/mod-playerbots) (with its core
+  fork) so random bots follow the players' expansion.
+
 ## Installation
 
 1. Clone into `modules/` of your AzerothCore source tree and rebuild:
@@ -215,13 +223,24 @@ Ramparts should show as locked under Specific Dungeons.
 Needs only g++ and tests the rules. The `core-build` workflow compiles the
 module against AzerothCore.
 
-## License
+## Troubleshooting
 
-GNU Affero General Public License v3.0, see [LICENSE](LICENSE).
+- **The build fails at link time.** A module that is present in `modules/` but disabled in CMake
+  still has its header found. Remove the directory of the optional module you don't use.
+- **Not sure which optional modules were found.** Read the `LfgProgression: enabled (...)` line in
+  `Server.log` after start; it says whether individual progression and playerbots were found.
+- **Random bots are still too high for the group.** The rule needs `LfgProgression.BotLock = 1`,
+  and it skips random bots you invited into your own group and the seasonal bosses.
 
 ## Credits
 
-Based on [MekBits/mod-lfg-expansion](https://github.com/MekBits/mod-lfg-expansion)
-(AGPL-3.0). Changes here: the module and its settings are renamed to
-`mod-lfg-progression` / `LfgProgression.*`, and later-expansion dungeons are
-locked as "quest not completed" instead of "insufficient expansion".
+Author: [buildthehomelab](https://github.com/buildthehomelab)
+
+Based on [MekBits/mod-lfg-expansion](https://github.com/MekBits/mod-lfg-expansion) (AGPL-3.0).
+Changes here: the module and its settings are renamed to `mod-lfg-progression` / `LfgProgression.*`,
+and later-expansion dungeons are locked as "quest not completed" instead of "insufficient
+expansion".
+
+## License
+
+GNU Affero General Public License v3.0, see [LICENSE](LICENSE).
