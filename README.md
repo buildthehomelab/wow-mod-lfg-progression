@@ -167,6 +167,13 @@ which were found.
   of their own -- but follow the players' expansion in the queue, as above.
   Your own altbots count like players. Without playerbots the bot rule is not
   built.
+- **Death Knight bots** get the end of the Ebon Hold chain (*Where Kings Walk*
+  or *Warchief's Blessing*). The core locks every dungeon for a Death Knight
+  who has not finished it, and bots never play it, so a party with a DK bot
+  could not queue ("does not have the required quest"). Playerbots only
+  rewards the chain with `AiPlayerbot.PreQuests = 1` and wipes it again when
+  it randomizes a bot, so the lock hook hands it out whenever the core locks
+  a bot for it. Real players still have to finish the chain themselves.
 
 A module that is present in `modules/` but disabled in CMake still has its
 header found, and the build then fails at link time. Remove the directory
@@ -229,6 +236,9 @@ module against AzerothCore.
   still has its header found. Remove the directory of the optional module you don't use.
 - **Not sure which optional modules were found.** Read the `LfgProgression: enabled (...)` line in
   `Server.log` after start; it says whether individual progression and playerbots were found.
+- **A Death Knight in the party "does not have the required quest".** A bot is fixed on the
+  next lock refresh (opening the Dungeon Finder, joining the group, level change). A real
+  player Death Knight has to finish the Ebon Hold chain; that lock is the core's.
 - **Random bots are still too high for the group.** The rule needs `LfgProgression.BotLock = 1`,
   and it skips random bots you invited into your own group and the seasonal bosses.
 
