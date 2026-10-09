@@ -59,6 +59,7 @@
 #include "LFG.h"
 #include "LFGMgr.h"
 #include "Log.h"
+#include "ObjectMgr.h"
 #include "Player.h"
 #include "ScriptMgr.h"
 #include "WorldSession.h"
@@ -144,6 +145,30 @@ namespace
     }
 
 #ifdef LFGP_WITH_PLAYERBOTS
+    // The core locks every dungeon for a Death Knight who has not finished the
+    // Ebon Hold chain: "Where Kings Walk" (Alliance) or "Warchief's Blessing"
+    // (Horde) must be rewarded (LFGMgr::InitializeLockedDungeons). Bots never
+    // play that chain -- playerbots only rewards it with AiPlayerbot.PreQuests,
+    // and wipes quests again when it randomizes a bot -- so a party with a DK
+    // bot could not queue at all: "does not have the required quest".
+    constexpr uint32 QUEST_WHERE_KINGS_WALK     = 13188;
+    constexpr uint32 QUEST_WARCHIEFS_BLESSING   = 13189;
+
+    bool IsBotWithoutEbonHoldChain(Player* player)
+    {
+        WorldSession* session = player->GetSession();
+        return session && session->IsHeadless() && player->IsClass(CLASS_DEATH_KNIGHT) && !player->IsGameMaster()
+            && !player->IsQuestRewarded(QUEST_WHERE_KINGS_WALK) && !player->IsQuestRewarded(QUEST_WARCHIEFS_BLESSING);
+    }
+
+    // Any requirement the core checks after the Death Knight one, which it
+    // skipped because that one locked first.
+    bool HasAccessRequirement(lfg::LFGDungeonData const* dungeon)
+    {
+        DungeonProgressionRequirements const* ar = sObjectMgr->GetAccessRequirement(dungeon->map, Difficulty(dungeon->difficulty));
+        return ar && (ar->reqItemLevel || !ar->items.empty() || !ar->quests.empty() || !ar->achievements.empty());
+    }
+
     // Queue entries by LFG's queue guid (the group's, otherwise the player's).
     // Written in the world thread on join and on level change in the map
     // threads, read by the LFG queue in a map updater thread.
@@ -249,8 +274,27 @@ public:
 
     void OnInitializeLockedDungeons(Player* player, uint8& level, uint32& lockData, lfg::LFGDungeonData const* dungeon) override
     {
+        if (!dungeon || !player || !g_settings.enabled)
+            return;
+
+#ifdef LFGP_WITH_PLAYERBOTS
+        // A DK bot gets the end of the Ebon Hold chain the first time the core
+        // locks a dungeon for it, so the rest of this pass sees the quest. Only
+        // this one dungeon was locked before the core's remaining checks ran;
+        // it is unlocked if it has none, otherwise the next pass (on opening
+        // the Dungeon Finder, joining a group, level change) gets it right.
+        // Runs in the world thread or the bot's own map thread.
+        if (lockData == lfg::LFG_LOCKSTATUS_QUEST_NOT_COMPLETED && IsBotWithoutEbonHoldChain(player))
+        {
+            player->SetRewardedQuest(player->GetTeamId(true) == TEAM_ALLIANCE ? QUEST_WHERE_KINGS_WALK : QUEST_WARCHIEFS_BLESSING);
+            LOG_INFO("module", "LfgProgression: Death Knight bot {} finished the Ebon Hold chain for the Dungeon Finder", player->GetName());
+            if (!HasAccessRequirement(dungeon))
+                lockData = 0;
+        }
+#endif
+
         // A dungeon the core already locked keeps its own reason.
-        if (lockData || !dungeon || !player || !g_settings.enabled)
+        if (lockData)
             return;
 
         // Random bots have no expansion of their own; they are held in the
