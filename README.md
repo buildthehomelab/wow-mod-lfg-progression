@@ -26,6 +26,39 @@ Category: Dungeons
 - Groups queue for the era of their least-progressed member.
 - Players you're matched with in the Dungeon Finder are never above the level cap of your era.
 
+## Progression explanations
+
+Use **`.lfgprogress`** in chat before queueing. It reports each online party
+character's effective era, identifies everyone setting the group's lowest era,
+and lists their missing Burning Crusade/Wrath requirements. Random bots do not
+set the era; your own altbots count like players. Offline members are not inspected.
+
+- IP characters get the actual era thresholds: **stage 8**, normally completing
+  **Into the Breach** after Naxxramas-40, and **stage 13**, normally defeating
+  **Kil'jaeden in Sunwell Plateau**. Custom progression rules may award these
+  stages differently. A lower configured realm progression limit is noted.
+- Characters outside IP get the required **level**, using the configured caps.
+- Selecting later-era specific dungeons reports each affected member and target
+  era once per queue request. Several selected dungeons in one era share a line.
+- A random queue downgrade names the requested and replacement eras/difficulties,
+  identifies the members setting the lowest era and explains their requirements.
+  These automatic messages go to the character submitting the queue request.
+
+Example: a Wrath character queueing with a Classic character sees that the
+party's random queue was changed to Classic, and that the Classic character
+must unlock stage 8 for Burning Crusade or stage 13 for Wrath.
+
+These are additional **chat explanations** of era eligibility. The stock client
+lock tooltip still says "required quest"; this change does not replace it.
+Other requirements (level range, gear, attunements, deserter status, etc.) still
+apply; unlocking an era alone does not guarantee eligibility. No addon, SQL or
+client patch is required.
+
+Validation: standalone rules/explanation tests cover IP/excluded characters,
+level boundaries, custom caps and disabled restrictions. CI checks the actual
+realm core with and without the optional IP header. Full server build and
+in-game queue/chat checks are required before calling the behavior verified live.
+
 ## Why
 
 From the client's own `LFGDungeons.dbc`:

@@ -54,6 +54,8 @@
 #include <set>
 #include <vector>
 
+#include "Chat.h"
+#include "ChatCommand.h"
 #include "Config.h"
 #include "Group.h"
 #include "LFG.h"
@@ -75,6 +77,7 @@
 #endif
 
 #include "lfg_progression_rules.h"
+#include "lfg_progression_explanations.h"
 
 namespace
 {
@@ -120,6 +123,52 @@ namespace
         if (LfgProgression::ExpansionForLevel(g_settings, level) == LfgProgression::EXPANSION_WOTLK)
             return LfgProgression::EXPANSION_WOTLK;
         return LfgProgression::PlayerExpansion(g_settings, level, IpTier(player));
+    }
+
+    struct MemberEra
+    {
+        Player* player;
+        uint8 level;
+        int ipTier;
+        uint8 expansion;
+    };
+
+    // These helpers are called only by chat/queue requests in the world thread,
+    // never by the per-dungeon lock or map-update proposal hooks.
+    std::vector<MemberEra> GroupEras(Player* player)
+    {
+        std::vector<MemberEra> members;
+        auto add = [&members](Player* member)
+        {
+            if (!member || IsRandomBot(member))
+                return;
+            uint8 const level = member->GetLevel();
+            int const ipTier = LfgProgression::ExpansionForLevel(g_settings, level) == LfgProgression::EXPANSION_WOTLK
+                ? -1 : IpTier(member);
+            members.push_back({ member, level, ipTier, LfgProgression::PlayerExpansion(g_settings, level, ipTier) });
+        };
+        if (Group* group = player->GetGroup())
+        {
+            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+                add(ref->GetSource());
+        }
+        else
+            add(player);
+        return members;
+    }
+
+    void ExplainRequirement(ChatHandler& chat, MemberEra const& member, uint8 target)
+    {
+        std::string const requirement = LfgProgression::UnlockRequirement(g_settings, member.level, member.ipTier, target);
+        if (requirement.empty())
+            return;
+        chat.PSendSysMessage("Dungeon Finder: {} must {} to enter {} dungeons.",
+            member.player->GetName(), requirement, LfgProgression::ExpansionName(target));
+#ifdef LFGP_WITH_INDIVIDUAL_PROGRESSION
+        uint8 const requiredStage = target == LfgProgression::EXPANSION_TBC ? PROGRESSION_PRE_TBC : PROGRESSION_TBC_TIER_5;
+        if (member.ipTier >= 0 && sIndividualProgression->progressionLimit && sIndividualProgression->progressionLimit < requiredStage)
+            chat.SendSysMessage("This requirement is above the realm's current progression limit.");
+#endif
     }
 
     // InitializeLockedDungeons() calls the lock hook once per dungeon with the
@@ -357,8 +406,8 @@ class LfgProgressionPlayer : public PlayerScript
 public:
     LfgProgressionPlayer() : PlayerScript("LfgProgressionPlayer", {
         PLAYERHOOK_ON_QUEUE_RANDOM_DUNGEON,
-#ifdef LFGP_WITH_PLAYERBOTS
         PLAYERHOOK_CAN_JOIN_LFG,
+#ifdef LFGP_WITH_PLAYERBOTS
         PLAYERHOOK_ON_LEVEL_CHANGED,
         PLAYERHOOK_ON_LOGOUT,
 #endif
@@ -377,17 +426,10 @@ public:
         if (IsRandomBot(player))
             return;
 
-        uint8 groupExpansion = PlayerExpansion(player, player->GetLevel());
-        if (Group* group = player->GetGroup())
-        {
-            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
-            {
-                Player* member = ref->GetSource();
-                if (!member || member == player || IsRandomBot(member))
-                    continue;
-                groupExpansion = LfgProgression::GroupExpansion({ groupExpansion, PlayerExpansion(member, member->GetLevel()) });
-            }
-        }
+        std::vector<MemberEra> const members = GroupEras(player);
+        uint8 groupExpansion = LfgProgression::EXPANSION_WOTLK;
+        for (MemberEra const& member : members)
+            groupExpansion = std::min(groupExpansion, member.expansion);
 
         uint32 const swapped = LfgProgression::RandomFor(g_settings, rDungeonId, groupExpansion);
         if (swapped == rDungeonId)
@@ -395,10 +437,19 @@ public:
 
         LOG_INFO("module", "LfgProgression: {} (level {}) queues random {} -> {} (group expansion {})",
                  player->GetName(), player->GetLevel(), rDungeonId, swapped, groupExpansion);
+        ChatHandler chat(player->GetSession());
+        chat.PSendSysMessage("Dungeon Finder: random queue changed from {}{} to {}{}. Your group's lowest era is {}.",
+            LfgProgression::ExpansionName(LfgProgression::RandomExpansion(rDungeonId)),
+            LfgProgression::IsHeroicRandom(rDungeonId) ? " Heroic" : "",
+            LfgProgression::ExpansionName(LfgProgression::RandomExpansion(swapped)),
+            LfgProgression::IsHeroicRandom(swapped) ? " Heroic" : "",
+            LfgProgression::ExpansionName(groupExpansion));
+        for (MemberEra const& member : members)
+            if (member.expansion == groupExpansion)
+                ExplainRequirement(chat, member, LfgProgression::RandomExpansion(rDungeonId));
         rDungeonId = swapped;
     }
 
-#ifdef LFGP_WITH_PLAYERBOTS
     // First in LFGMgr::JoinLfg, with the player who queues -- the group
     // leader, if there is a group. Random bots come here too (they send
     // CMSG_LFG_JOIN, which HandleBotPackets runs in the world thread).
@@ -407,6 +458,27 @@ public:
         if (!player)
             return true;
 
+        if (g_settings.enabled && !IsRandomBot(player))
+        {
+            // At most one explanation per member and target era, even when
+            // several specific dungeons are selected. Random entries are
+            // explained by the swap hook instead. Core eligibility still runs.
+            bool targets[3] = {};
+            for (uint32 id : dungeons)
+                if (lfg::LFGDungeonData const* dungeon = sLFGMgr->GetLFGDungeon(id))
+                    if (dungeon->type != lfg::LFG_TYPE_RANDOM && dungeon->expansion < 3)
+                        targets[dungeon->expansion] = true;
+            if (targets[1] || targets[2])
+            {
+                ChatHandler chat(player->GetSession());
+                for (MemberEra const& member : GroupEras(player))
+                    for (uint8 target = 1; target <= 2; ++target)
+                        if (targets[target])
+                            ExplainRequirement(chat, member, target);
+            }
+        }
+
+#ifdef LFGP_WITH_PLAYERBOTS
         Group* group = player->GetGroup();
         ObjectGuid const key = group ? group->GetGUID() : player->GetGUID();
 
@@ -423,9 +495,11 @@ public:
 
         std::lock_guard<std::mutex> lock(g_queueMutex);
         g_queueEntries[key] = entry;
+#endif
         return true;
     }
 
+#ifdef LFGP_WITH_PLAYERBOTS
     // A random bot can be randomized while it is in the queue.
     void OnPlayerLevelChanged(Player* player, uint8 /*oldLevel*/) override
     {
@@ -472,8 +546,51 @@ public:
 };
 #endif
 
+class LfgProgressionCommands : public CommandScript
+{
+public:
+    LfgProgressionCommands() : CommandScript("LfgProgressionCommands") { }
+
+    Acore::ChatCommands::ChatCommandTable GetCommands() const override
+    {
+        static Acore::ChatCommands::ChatCommandTable commands =
+        {
+            { "lfgprogress", HandleStatus, SEC_PLAYER, Acore::ChatCommands::Console::No },
+        };
+        return commands;
+    }
+
+    static bool HandleStatus(ChatHandler* chat)
+    {
+        Player* player = chat->GetPlayer();
+        if (!player)
+            return false;
+        if (!g_settings.enabled)
+        {
+            chat->SendSysMessage("Dungeon Finder progression restrictions are disabled.");
+            return true;
+        }
+        auto const members = GroupEras(player);
+        uint8 lowest = LfgProgression::EXPANSION_WOTLK;
+        for (MemberEra const& member : members)
+            lowest = std::min(lowest, member.expansion);
+        chat->PSendSysMessage("Dungeon Finder: your group's lowest era is {}. Online characters are checked; random bots do not set the era.",
+            LfgProgression::ExpansionName(lowest));
+        for (MemberEra const& member : members)
+        {
+            chat->PSendSysMessage("{}: {}{}.", member.player->GetName(), LfgProgression::ExpansionName(member.expansion),
+                member.expansion == lowest ? " (sets the group's era)" : "");
+            ExplainRequirement(*chat, member, LfgProgression::EXPANSION_TBC);
+            ExplainRequirement(*chat, member, LfgProgression::EXPANSION_WOTLK);
+        }
+        chat->SendSysMessage("Level ranges, attunements, gear and other Dungeon Finder requirements still apply. The stock lock tooltip may say required quest; these messages explain the era requirement.");
+        return true;
+    }
+};
+
 void AddLfgProgressionScripts()
 {
+    new LfgProgressionCommands();
     new LfgProgressionWorld();
     new LfgProgressionGlobal();
     new LfgProgressionPlayer();

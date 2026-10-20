@@ -1,5 +1,6 @@
 // Logic test for the mod-lfg-progression rules. No AzerothCore -- only the rules.
 #include "lfg_progression_rules.h"
+#include "lfg_progression_explanations.h"
 
 #include <cstdio>
 #include <vector>
@@ -143,6 +144,28 @@ int main()
     ExpectN("TBC leader + vanilla member -> vanilla", GroupExpansion({ EXPANSION_TBC, EXPANSION_CLASSIC }), EXPANSION_CLASSIC);
     ExpectN("WotLK + TBC + WotLK -> TBC", GroupExpansion({ EXPANSION_WOTLK, EXPANSION_TBC, EXPANSION_WOTLK }), EXPANSION_TBC);
     ExpectN("solo WotLK", GroupExpansion({ EXPANSION_WOTLK }), EXPANSION_WOTLK);
+
+    std::printf("\n--- explanations agree with eligibility ---\n");
+    for (uint8_t level : { uint8_t(60), uint8_t(61), uint8_t(70), uint8_t(71) })
+        for (int tier : { -1, 0, 1, 2 })
+            for (uint8_t target : { uint8_t(0), uint8_t(1), uint8_t(2) })
+                Expect("explanation exists exactly when era is locked",
+                    !UnlockRequirement(def, level, tier, target).empty(),
+                    IsPlayerLocked(def, PlayerExpansion(def, level, tier), target, false));
+    Expect("excluded account gets a level requirement",
+        UnlockRequirement(def, 60, -1, EXPANSION_TBC) == "reach level 61", true);
+    Expect("TBC level boundary is 71",
+        UnlockRequirement(def, 70, -1, EXPANSION_WOTLK) == "reach level 71", true);
+    Expect("Classic IP requires the portal transition, not only Naxx40",
+        UnlockRequirement(def, 60, 0, EXPANSION_TBC).find("Into the Breach") != std::string::npos, true);
+    Expect("Wrath IP identifies Sunwell completion",
+        UnlockRequirement(def, 70, 1, EXPANSION_WOTLK).find("Kil'jaeden") != std::string::npos, true);
+    { Settings s; s.classicMaxLevel = 58; s.tbcMaxLevel = 68;
+      Expect("custom Classic cap is reflected", UnlockRequirement(s, 58, -1, 1) == "reach level 59", true);
+      Expect("custom TBC cap is reflected", UnlockRequirement(s, 68, -1, 2) == "reach level 69", true); }
+    { Settings s; s.enabled = false;
+      Expect("disabled module has no unlock requirement", UnlockRequirement(s, 60, 0, 1).empty(), true); }
+    Expect("unknown expansion has no invented requirement", UnlockRequirement(def, 60, 0, 3).empty(), true);
 
     std::printf("\n%s\n", g_fail ? "FAILED" : "all ok");
     return g_fail ? 1 : 0;
