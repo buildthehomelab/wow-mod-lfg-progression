@@ -13,7 +13,7 @@ jobs:
       packages: read
     with:
       core-ref: e3cdb38576c4e42a408d16ed6f2c60fce3d71685
-      extra-modules: buildthehomelab/wow-mod-individual-progression@edf5730e92c701adf42633e755d1d7948ac2c64f
+      extra-modules: buildthehomelab/wow-mod-individual-progression@46ab14dce6be2b6c83435220a5f190573f516bf4
   standalone-core:
     uses: buildthehomelab/wow-ci/.github/workflows/ci.yml@main
     permissions:
