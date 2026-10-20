@@ -1,19 +1,29 @@
-name: core-build
+name: CI
 on:
   push:
-    branches:
-      - 'master'
-      - 'main'
+    branches: [main]
   pull_request:
-    branches:
-      - 'master'
-      - 'main'
   workflow_dispatch:
 
 jobs:
-  build:
-    uses: azerothcore/reusable-workflows/.github/workflows/core_build_modules.yml@main
+  realm-core:
+    uses: buildthehomelab/wow-ci/.github/workflows/ci.yml@main
+    permissions:
+      contents: read
+      packages: read
     with:
-      # The checkout folder, which AzerothCore turns into the loader name: the repo is
-      # wow-mod-lfg-progression, the module (and Addmod_lfg_progressionScripts) is not.
-      module_repo: mod-lfg-progression
+      core-ref: e3cdb38576c4e42a408d16ed6f2c60fce3d71685
+      extra-modules: buildthehomelab/wow-mod-individual-progression@46ab14dce6be2b6c83435220a5f190573f516bf4
+  standalone-core:
+    uses: buildthehomelab/wow-ci/.github/workflows/ci.yml@main
+    permissions:
+      contents: read
+      packages: read
+    with:
+      core-ref: e3cdb38576c4e42a408d16ed6f2c60fce3d71685
+      only: cpp
+  rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./test/run.sh
