@@ -54,10 +54,8 @@ Other requirements (level range, gear, attunements, deserter status, etc.) still
 apply; unlocking an era alone does not guarantee eligibility. No addon, SQL or
 client patch is required.
 
-Validation: standalone rules/explanation tests cover IP/excluded characters,
-level boundaries, custom caps and disabled restrictions. CI checks the actual
-realm core with and without the optional IP header. Full server build and
-in-game queue/chat checks are required before calling the behavior verified live.
+Not yet checked in a game client: the era-eligibility chat explanations and the in-game queue
+behavior with them. The rules are covered by the tests below.
 
 ## Why
 
