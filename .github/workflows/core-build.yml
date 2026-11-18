@@ -5,6 +5,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A newer push to the same pull request or branch cancels the older run still queued or running
+concurrency:
+  group: core-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   realm-core:
     uses: buildthehomelab/wow-ci/.github/workflows/ci.yml@main
